@@ -66,10 +66,16 @@ private:
     void RecordMouseOperation(MouseEventType eventType, POINT position, HWND foregroundWindow, HWND pointWindow);
     void ProcessRecordQueue();  // 处理记录队列的工作线程
     
-    std::wstring GetElementContentAtPoint(POINT pt, HWND targetWindow);
+    // 返回元素内容和类型
+    struct ElementInfo {
+        std::wstring content;
+        std::wstring elementType;
+    };
+    ElementInfo GetElementContentAtPoint(POINT pt, HWND targetWindow);
+    
     std::wstring GetApplicationName(HWND hwnd);
     std::wstring GetWindowTitle(HWND hwnd);
-    std::wstring GetElementTypeAtPoint(POINT pt, IUIAutomationElement* element);
+    std::wstring GetElementTypeString(CONTROLTYPEID controlType);
     HWND GetRootOwnerWindow(HWND hwnd);  // 获取顶层窗口
     
     void CleanupOldRecords();  // 清理超过1小时的记录

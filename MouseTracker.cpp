@@ -205,6 +205,9 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
     record.eventType = eventType;
     record.position = position;
 
+    // 立即获取，不延迟（点击时的状态就是我们要的）
+    // 之前的延迟可能导致界面已经改变，反而获取了错误的内容
+
     // 使用前台活动窗口来确定应用程序（更准确）
     if (foregroundWindow && IsWindow(foregroundWindow)) {
         // 获取顶层窗口（避免子窗口导致的错误）
@@ -215,9 +218,12 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
         
         // 使用坐标位置的窗口进行 UI Automation 查询（精确定位元素）
         try {
-            record.content = GetElementContentAtPoint(position, pointWindow);
+            ElementInfo info = GetElementContentAtPoint(position, pointWindow);
+            record.content = info.content;
+            record.elementType = info.elementType;
         } catch (...) {
             record.content = L"[Error getting content]";
+            record.elementType = L"Unknown";
         }
     } else {
         // 降级处理：如果前台窗口无效，使用坐标窗口
@@ -227,9 +233,12 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
             record.windowTitle = GetWindowTitle(rootWindow);
             
             try {
-                record.content = GetElementContentAtPoint(position, pointWindow);
+                ElementInfo info = GetElementContentAtPoint(position, pointWindow);
+                record.content = info.content;
+                record.elementType = info.elementType;
             } catch (...) {
                 record.content = L"[Error getting content]";
+                record.elementType = L"Unknown";
             }
         }
     }
@@ -257,13 +266,23 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
     }
 }
 
-std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow) {
-    if (!m_pAutomation) return L"";
+MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow) {
+    ElementInfo result;
+    result.content = L"";
+    result.elementType = L"Unknown";
+    
+    if (!m_pAutomation) return result;
 
     IUIAutomationElement* element = nullptr;
     HRESULT hr = E_FAIL;
     
+    // 调试信息：记录正在查询的坐标
+    #ifdef _DEBUG
+    std::wcout << L"[DEBUG] Querying element at position: (" << pt.x << L", " << pt.y << L")\n";
+    #endif
+    
     // 方法1: 优先使用 ElementFromPoint（更准确）
+    // 注意：这里使用的是点击时记录的坐标 pt，而不是当前鼠标位置
     hr = m_pAutomation->ElementFromPoint(pt, &element);
     
     // 方法2: 如果失败，尝试从窗口句柄获取元素
@@ -283,22 +302,22 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow)
     }
     
     if (FAILED(hr) || !element) {
-        return L"";
+        return result;
     }
 
-    std::wstring content;
     BSTR name = nullptr;
     CONTROLTYPEID controlType;
 
     // 获取元素名称
     hr = element->get_CurrentName(&name);
     if (SUCCEEDED(hr) && name) {
-        content = name;
+        result.content = name;
         SysFreeString(name);
     }
 
     // 获取控件类型
     element->get_CurrentControlType(&controlType);
+    result.elementType = GetElementTypeString(controlType);
     
     // 根据控件类型获取特定信息
     switch (controlType) {
@@ -311,7 +330,7 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow)
             if (valuePattern) {
                 valuePattern->get_CurrentValue(&url);
                 if (url) {
-                    content += L" [URL: " + std::wstring(url) + L"]";
+                    result.content += L" [URL: " + std::wstring(url) + L"]";
                     SysFreeString(url);
                 }
                 valuePattern->Release();
@@ -320,8 +339,8 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow)
         }
         case UIA_ButtonControlTypeId: {
             // 按钮
-            if (content.empty()) {
-                content = L"[Button]";
+            if (result.content.empty()) {
+                result.content = L"[Button]";
             }
             break;
         }
@@ -351,7 +370,7 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow)
                                     BSTR selectedText = nullptr;
                                     selection->GetText(-1, &selectedText);
                                     if (selectedText && wcslen(selectedText) > 0) {
-                                        content = L"[Selected Text: " + std::wstring(selectedText) + L"]";
+                                        result.content = L"[Selected Text: " + std::wstring(selectedText) + L"]";
                                         SysFreeString(selectedText);
                                     }
                                     selection->Release();
@@ -369,35 +388,18 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow)
         }
         case UIA_TabItemControlTypeId: {
             // Tab 页
-            if (!content.empty()) {
-                content = L"[Tab: " + content + L"]";
+            if (!result.content.empty()) {
+                result.content = L"[Tab: " + result.content + L"]";
             }
             break;
         }
     }
 
-    // 存储元素类型
-    MouseOperationRecord* lastRecord = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(m_recordsMutex);
-        if (!m_records.empty()) {
-            lastRecord = &m_records.back();
-        }
-    }
-    if (lastRecord) {
-        lastRecord->elementType = GetElementTypeAtPoint(pt, element);
-    }
-
     element->Release();
-    return content;
+    return result;
 }
 
-std::wstring MouseTracker::GetElementTypeAtPoint(POINT pt, IUIAutomationElement* element) {
-    if (!element) return L"Unknown";
-
-    CONTROLTYPEID controlType;
-    element->get_CurrentControlType(&controlType);
-
+std::wstring MouseTracker::GetElementTypeString(CONTROLTYPEID controlType) {
     switch (controlType) {
         case UIA_ButtonControlTypeId: return L"Button";
         case UIA_HyperlinkControlTypeId: return L"Hyperlink";
