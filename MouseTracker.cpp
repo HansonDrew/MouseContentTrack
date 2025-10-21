@@ -64,10 +64,14 @@ bool MouseTracker::Initialize() {
 void MouseTracker::Start() {
     if (m_isRunning) return;
 
+    m_isRunning = true;
+
+    // 启动处理线程
+    m_processingThread = std::thread(&MouseTracker::ProcessRecordQueue, this);
+
     // 安装鼠标钩子
     m_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, GetModuleHandle(nullptr), 0);
     if (m_mouseHook) {
-        m_isRunning = true;
         m_logFile << L"Mouse hook installed successfully.\n" << std::flush;
     }
 }
@@ -75,11 +79,18 @@ void MouseTracker::Start() {
 void MouseTracker::Stop() {
     if (!m_isRunning) return;
 
+    m_isRunning = false;
+
+    // 唤醒处理线程并等待其结束
+    m_queueCondition.notify_all();
+    if (m_processingThread.joinable()) {
+        m_processingThread.join();
+    }
+
     if (m_mouseHook) {
         UnhookWindowsHookEx(m_mouseHook);
         m_mouseHook = nullptr;
     }
-    m_isRunning = false;
 
     if (m_logFile.is_open()) {
         m_logFile << L"========== Mouse Tracker Stopped at " << GetCurrentTimeString() << L" ==========\n" << std::flush;
@@ -87,7 +98,7 @@ void MouseTracker::Stop() {
 }
 
 LRESULT CALLBACK MouseTracker::MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && s_instance) {
+    if (nCode >= 0 && s_instance && s_instance->m_isRunning) {
         const MSLLHOOKSTRUCT* mouseInfo = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         
         // 忽略拖动窗口的情况（通过检测是否在非客户区）
@@ -134,22 +145,72 @@ void MouseTracker::ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseI
     }
 
     if (eventType != MouseEventType::UNKNOWN) {
-        RecordMouseOperation(eventType, mouseInfo->pt);
+        // 快速入队，不阻塞钩子
+        HWND hwnd = WindowFromPoint(mouseInfo->pt);
+        PendingMouseEvent event;
+        event.eventType = eventType;
+        event.position = mouseInfo->pt;
+        event.hwnd = hwnd;
+        event.timestamp = std::chrono::system_clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(s_instance->m_queueMutex);
+            s_instance->m_eventQueue.push(event);
+        }
+        s_instance->m_queueCondition.notify_one();
     }
 }
 
-void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position) {
+void MouseTracker::ProcessRecordQueue() {
+    // 在工作线程中初始化 COM（每个线程需要单独初始化）
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    while (m_isRunning) {
+        PendingMouseEvent event;
+        
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+            // 等待队列有数据或停止信号
+            m_queueCondition.wait(lock, [this] { 
+                return !m_eventQueue.empty() || !m_isRunning; 
+            });
+
+            if (!m_isRunning && m_eventQueue.empty()) {
+                break;
+            }
+
+            if (!m_eventQueue.empty()) {
+                event = m_eventQueue.front();
+                m_eventQueue.pop();
+            } else {
+                continue;
+            }
+        }
+
+        // 在工作线程中处理耗时操作
+        RecordMouseOperation(event.eventType, event.position, event.hwnd);
+    }
+
+    CoUninitialize();
+}
+
+void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position, HWND hwnd) {
     MouseOperationRecord record;
     record.timestamp = std::chrono::system_clock::now();
     record.eventType = eventType;
     record.position = position;
 
-    // 获取鼠标位置的窗口
-    HWND hwnd = WindowFromPoint(position);
-    if (hwnd) {
+    // 获取鼠标位置的窗口信息（这些操作现在在工作线程中执行）
+    if (hwnd && IsWindow(hwnd)) {
         record.applicationName = GetApplicationName(hwnd);
         record.windowTitle = GetWindowTitle(hwnd);
-        record.content = GetElementContentAtPoint(position);
+        
+        // UI Automation 调用（耗时操作）
+        try {
+            record.content = GetElementContentAtPoint(position);
+        } catch (...) {
+            record.content = L"[Error getting content]";
+        }
     }
 
     // 添加到记录列表
@@ -159,7 +220,7 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
         CleanupOldRecords();
     }
 
-    // 打印到控制台
+    // 打印到控制台（异步，不会阻塞钩子）
     std::wcout << L"\n[" << GetCurrentTimeString() << L"] "
                << L"Event: " << MouseEventTypeToString(eventType) << L"\n"
                << L"Position: (" << position.x << L", " << position.y << L")\n"
@@ -169,7 +230,7 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
                << L"Element Type: " << record.elementType << L"\n"
                << std::flush;
 
-    // 写入日志文件
+    // 写入日志文件（异步）
     if (m_logFile.is_open()) {
         m_logFile << record.toJson() << L"\n" << std::flush;
     }
@@ -179,6 +240,8 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt) {
     if (!m_pAutomation) return L"";
 
     IUIAutomationElement* element = nullptr;
+    
+    // 添加超时保护
     HRESULT hr = m_pAutomation->ElementFromPoint(pt, &element);
     
     if (FAILED(hr) || !element) {
@@ -190,8 +253,8 @@ std::wstring MouseTracker::GetElementContentAtPoint(POINT pt) {
     CONTROLTYPEID controlType;
 
     // 获取元素名称
-    element->get_CurrentName(&name);
-    if (name) {
+    hr = element->get_CurrentName(&name);
+    if (SUCCEEDED(hr) && name) {
         content = name;
         SysFreeString(name);
     }

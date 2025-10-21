@@ -9,6 +9,10 @@
 #include <fstream>
 #include <comdef.h>
 #include <oleacc.h>
+#include <queue>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 
 #pragma comment(lib, "oleacc.lib")
 
@@ -34,6 +38,14 @@ struct MouseOperationRecord {
     std::wstring toJson() const;
 };
 
+// 待处理的鼠标事件
+struct PendingMouseEvent {
+    MouseEventType eventType;
+    POINT position;
+    HWND hwnd;
+    std::chrono::system_clock::time_point timestamp;
+};
+
 class MouseTracker {
 public:
     MouseTracker();
@@ -50,7 +62,8 @@ private:
     static MouseTracker* s_instance;
 
     void ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseInfo);
-    void RecordMouseOperation(MouseEventType eventType, POINT position);
+    void RecordMouseOperation(MouseEventType eventType, POINT position, HWND hwnd);
+    void ProcessRecordQueue();  // 处理记录队列的工作线程
     
     std::wstring GetElementContentAtPoint(POINT pt);
     std::wstring GetApplicationName(HWND hwnd);
@@ -65,7 +78,13 @@ private:
     std::vector<MouseOperationRecord> m_records;
     std::mutex m_recordsMutex;
     
-    bool m_isRunning;
+    // 异步处理队列
+    std::queue<PendingMouseEvent> m_eventQueue;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCondition;
+    std::thread m_processingThread;
+    std::atomic<bool> m_isRunning;
+    
     DWORD m_lastClickTime;
     POINT m_lastClickPos;
     
