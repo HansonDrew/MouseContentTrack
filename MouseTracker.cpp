@@ -146,11 +146,16 @@ void MouseTracker::ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseI
 
     if (eventType != MouseEventType::UNKNOWN) {
         // 快速入队，不阻塞钩子
-        HWND hwnd = WindowFromPoint(mouseInfo->pt);
         PendingMouseEvent event;
         event.eventType = eventType;
         event.position = mouseInfo->pt;
-        event.hwnd = hwnd;
+        
+        // 获取前台活动窗口（用于确定应用程序）
+        event.foregroundWindow = GetForegroundWindow();
+        
+        // 获取坐标位置的窗口（用于 UI Automation 定位元素）
+        event.pointWindow = WindowFromPoint(mouseInfo->pt);
+        
         event.timestamp = std::chrono::system_clock::now();
 
         {
@@ -188,28 +193,44 @@ void MouseTracker::ProcessRecordQueue() {
         }
 
         // 在工作线程中处理耗时操作
-        RecordMouseOperation(event.eventType, event.position, event.hwnd);
+        RecordMouseOperation(event.eventType, event.position, event.foregroundWindow, event.pointWindow);
     }
 
     CoUninitialize();
 }
 
-void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position, HWND hwnd) {
+void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position, HWND foregroundWindow, HWND pointWindow) {
     MouseOperationRecord record;
     record.timestamp = std::chrono::system_clock::now();
     record.eventType = eventType;
     record.position = position;
 
-    // 获取鼠标位置的窗口信息（这些操作现在在工作线程中执行）
-    if (hwnd && IsWindow(hwnd)) {
-        record.applicationName = GetApplicationName(hwnd);
-        record.windowTitle = GetWindowTitle(hwnd);
+    // 使用前台活动窗口来确定应用程序（更准确）
+    if (foregroundWindow && IsWindow(foregroundWindow)) {
+        // 获取顶层窗口（避免子窗口导致的错误）
+        HWND rootWindow = GetRootOwnerWindow(foregroundWindow);
         
-        // UI Automation 调用（耗时操作）
+        record.applicationName = GetApplicationName(rootWindow);
+        record.windowTitle = GetWindowTitle(rootWindow);
+        
+        // 使用坐标位置的窗口进行 UI Automation 查询（精确定位元素）
         try {
-            record.content = GetElementContentAtPoint(position);
+            record.content = GetElementContentAtPoint(position, pointWindow);
         } catch (...) {
             record.content = L"[Error getting content]";
+        }
+    } else {
+        // 降级处理：如果前台窗口无效，使用坐标窗口
+        if (pointWindow && IsWindow(pointWindow)) {
+            HWND rootWindow = GetRootOwnerWindow(pointWindow);
+            record.applicationName = GetApplicationName(rootWindow);
+            record.windowTitle = GetWindowTitle(rootWindow);
+            
+            try {
+                record.content = GetElementContentAtPoint(position, pointWindow);
+            } catch (...) {
+                record.content = L"[Error getting content]";
+            }
         }
     }
 
@@ -236,13 +257,30 @@ void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position
     }
 }
 
-std::wstring MouseTracker::GetElementContentAtPoint(POINT pt) {
+std::wstring MouseTracker::GetElementContentAtPoint(POINT pt, HWND targetWindow) {
     if (!m_pAutomation) return L"";
 
     IUIAutomationElement* element = nullptr;
+    HRESULT hr = E_FAIL;
     
-    // 添加超时保护
-    HRESULT hr = m_pAutomation->ElementFromPoint(pt, &element);
+    // 方法1: 优先使用 ElementFromPoint（更准确）
+    hr = m_pAutomation->ElementFromPoint(pt, &element);
+    
+    // 方法2: 如果失败，尝试从窗口句柄获取元素
+    if (FAILED(hr) || !element) {
+        if (targetWindow && IsWindow(targetWindow)) {
+            hr = m_pAutomation->ElementFromHandle(targetWindow, &element);
+            if (SUCCEEDED(hr) && element) {
+                // 从窗口元素查找坐标位置的子元素
+                IUIAutomationElement* childElement = nullptr;
+                hr = m_pAutomation->ElementFromPoint(pt, &childElement);
+                if (SUCCEEDED(hr) && childElement) {
+                    element->Release();
+                    element = childElement;
+                }
+            }
+        }
+    }
     
     if (FAILED(hr) || !element) {
         return L"";
@@ -376,12 +414,36 @@ std::wstring MouseTracker::GetElementTypeAtPoint(POINT pt, IUIAutomationElement*
     }
 }
 
+HWND MouseTracker::GetRootOwnerWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return nullptr;
+    }
+    
+    // 获取顶层所有者窗口
+    HWND rootWindow = GetAncestor(hwnd, GA_ROOTOWNER);
+    if (!rootWindow) {
+        rootWindow = hwnd;
+    }
+    
+    return rootWindow;
+}
+
 std::wstring MouseTracker::GetApplicationName(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return L"Unknown";
+    }
+    
     DWORD processId = 0;
     GetWindowThreadProcessId(hwnd, &processId);
+    
+    if (processId == 0) {
+        return L"Unknown";
+    }
 
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-    if (!hProcess) return L"Unknown";
+    if (!hProcess) {
+        return L"Unknown";
+    }
 
     wchar_t processName[MAX_PATH] = L"";
     DWORD size = MAX_PATH;
@@ -400,9 +462,24 @@ std::wstring MouseTracker::GetApplicationName(HWND hwnd) {
 }
 
 std::wstring MouseTracker::GetWindowTitle(HWND hwnd) {
-    wchar_t title[256] = L"";
-    GetWindowText(hwnd, title, 256);
-    return std::wstring(title);
+    if (!hwnd || !IsWindow(hwnd)) {
+        return L"";
+    }
+    
+    wchar_t title[512] = L"";
+    int length = GetWindowText(hwnd, title, 512);
+    
+    if (length > 0) {
+        return std::wstring(title);
+    }
+    
+    // 如果窗口标题为空，尝试获取类名
+    wchar_t className[256] = L"";
+    if (GetClassName(hwnd, className, 256) > 0) {
+        return std::wstring(L"[") + className + L"]";
+    }
+    
+    return L"";
 }
 
 void MouseTracker::CleanupOldRecords() {

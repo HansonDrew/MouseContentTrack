@@ -42,7 +42,8 @@ struct MouseOperationRecord {
 struct PendingMouseEvent {
     MouseEventType eventType;
     POINT position;
-    HWND hwnd;
+    HWND foregroundWindow;      // 前台活动窗口
+    HWND pointWindow;           // 坐标位置的窗口（用于 UI Automation）
     std::chrono::system_clock::time_point timestamp;
 };
 
@@ -62,13 +63,14 @@ private:
     static MouseTracker* s_instance;
 
     void ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseInfo);
-    void RecordMouseOperation(MouseEventType eventType, POINT position, HWND hwnd);
+    void RecordMouseOperation(MouseEventType eventType, POINT position, HWND foregroundWindow, HWND pointWindow);
     void ProcessRecordQueue();  // 处理记录队列的工作线程
     
-    std::wstring GetElementContentAtPoint(POINT pt);
+    std::wstring GetElementContentAtPoint(POINT pt, HWND targetWindow);
     std::wstring GetApplicationName(HWND hwnd);
     std::wstring GetWindowTitle(HWND hwnd);
     std::wstring GetElementTypeAtPoint(POINT pt, IUIAutomationElement* element);
+    HWND GetRootOwnerWindow(HWND hwnd);  // 获取顶层窗口
     
     void CleanupOldRecords();  // 清理超过1小时的记录
     
