@@ -77,6 +77,18 @@ private:
     std::wstring GetElementTypeString(CONTROLTYPEID controlType);
     HWND GetRootOwnerWindow(HWND hwnd);  // 获取顶层窗口
     
+    // 新增：尝试从元素获取内容（封装所有获取方法）
+    std::wstring TryGetElementContent(IUIAutomationElement* element, CONTROLTYPEID controlType);
+    
+    // 新增：递归遍历元素树查找内容
+    std::wstring TraverseForContent(IUIAutomationElement* element, IUIAutomationTreeWalker* walker, int depth, int maxDepth);
+    
+    // 新增：在元素树中查找包含指定坐标的元素
+    IUIAutomationElement* FindElementAtPointInTree(IUIAutomationElement* element, POINT pt, IUIAutomationTreeWalker* walker, int depth);
+    
+    // 新增：查找内容区域（类似 BrowserContentExtractor::FindDocumentElement）
+    IUIAutomationElement* FindContentArea(IUIAutomationElement* rootElement);
+    
     void CleanupOldRecords();  // 清理超过1小时的记录
     
     HHOOK m_mouseHook;

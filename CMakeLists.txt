@@ -10,6 +10,10 @@ set(SOURCES
     main.cpp
     MouseTracker.cpp
     MouseTracker.h
+    BrowserContentExtractor.h
+    BrowserContentExtractor.cpp
+    Logger.cpp
+    Logger.h
 )
 
 # 创建可执行文件
