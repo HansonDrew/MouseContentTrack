@@ -150,10 +150,8 @@ void MouseTracker::ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseI
         event.eventType = eventType;
         event.position = mouseInfo->pt;
         
-        // 获取前台活动窗口（用于确定应用程序）
-        event.foregroundWindow = GetForegroundWindow();
-        
-        // 获取坐标位置的窗口（用于 UI Automation 定位元素）
+        // 只获取坐标位置的窗口（用于 UI Automation）
+        // 前台窗口在工作线程中延迟获取，以确保窗口切换完成
         event.pointWindow = WindowFromPoint(mouseInfo->pt);
         
         event.timestamp = std::chrono::system_clock::now();
@@ -193,20 +191,35 @@ void MouseTracker::ProcessRecordQueue() {
         }
 
         // 在工作线程中处理耗时操作
-        RecordMouseOperation(event.eventType, event.position, event.foregroundWindow, event.pointWindow);
+        RecordMouseOperation(event.eventType, event.position, event.pointWindow);
     }
 
     CoUninitialize();
 }
 
-void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position, HWND foregroundWindow, HWND pointWindow) {
+void MouseTracker::RecordMouseOperation(MouseEventType eventType, POINT position, HWND pointWindow) {
     MouseOperationRecord record;
     record.timestamp = std::chrono::system_clock::now();
     record.eventType = eventType;
     record.position = position;
 
-    // 立即获取，不延迟（点击时的状态就是我们要的）
-    // 之前的延迟可能导致界面已经改变，反而获取了错误的内容
+    // 短暂延迟，等待窗口切换完成
+    // 当用户点击切换窗口时，需要给系统一点时间来更新前台窗口
+    Sleep(50);  // 50ms 延迟足够窗口切换完成
+
+    // 现在获取前台窗口，此时应该已经切换到新窗口了
+    HWND foregroundWindow = GetForegroundWindow();
+    
+    // 调试输出：对比坐标窗口和前台窗口
+    #ifdef _DEBUG
+    if (pointWindow && IsWindow(pointWindow)) {
+        HWND pointRoot = GetRootOwnerWindow(pointWindow);
+        std::wstring pointApp = GetApplicationName(pointRoot);
+        std::wstring foreApp = GetApplicationName(GetRootOwnerWindow(foregroundWindow));
+        std::wcout << L"[DEBUG] PointWindow: " << pointApp 
+                   << L", ForegroundWindow: " << foreApp << L"\n";
+    }
+    #endif
 
     // 使用前台活动窗口来确定应用程序（更准确）
     if (foregroundWindow && IsWindow(foregroundWindow)) {
@@ -287,6 +300,8 @@ MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND 
     
     // 方法2: 如果失败，尝试从窗口句柄获取元素
     if (FAILED(hr) || !element) {
+        std::wcout << L"[DEBUG] Get element from point failed)\n";
+
         if (targetWindow && IsWindow(targetWindow)) {
             hr = m_pAutomation->ElementFromHandle(targetWindow, &element);
             if (SUCCEEDED(hr) && element) {
@@ -299,6 +314,8 @@ MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND 
                 }
             }
         }
+    } else {
+        std::wcout << L"[DEBUG] Get element from point succeeded\n";
     }
     
     if (FAILED(hr) || !element) {
