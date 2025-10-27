@@ -357,115 +357,94 @@ MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND 
     
     if (!m_pAutomation) return result;
 
-    // ✅ 调试：输出原始点击坐标和窗口信息
-    std::wcout << L"[DEBUG] ===== GetElementContentAtPoint called =====\n";
-    std::wcout << L"[DEBUG] Click coordinates: (" << pt.x << L", " << pt.y << L")\n";
-    std::wcout << L"[DEBUG] Target window handle: " << targetWindow << L"\n";
-
-    // 输出目标窗口的详细信息
-    if (targetWindow && IsWindow(targetWindow)) {
-        wchar_t windowTitle[256] = {0};
-        GetWindowTextW(targetWindow, windowTitle, 256);
-        wchar_t className[256] = {0};
-        GetClassNameW(targetWindow, className, 256);
-        std::wcout << L"[DEBUG] Target window title: \"" << windowTitle << L"\"\n";
-        std::wcout << L"[DEBUG] Target window class: \"" << className << L"\"\n";
-    }
-
-    // ✅ 关键修复：使用传入的 targetWindow（点击时的窗口），而不是 GetForegroundWindow
+    // ✅ 使用树遍历方案（更准确、延迟更低）
     HWND hwnd = targetWindow;
     if (!hwnd || !IsWindow(hwnd)) {
-        std::wcout << L"[DEBUG] Target window invalid, using foreground window as fallback\n";
         hwnd = GetForegroundWindow();
     }
     
-    std::wcout << L"[DEBUG] Using window handle: " << hwnd << L"\n";
-    
     if (!hwnd || !IsWindow(hwnd)) {
-        std::wcout << L"[DEBUG] Invalid window handle!\n";
         return result;
     }
     
-    // ✅ 检查窗口位置和大小
-    RECT windowRect;
-    GetWindowRect(hwnd, &windowRect);
-    std::wcout << L"[DEBUG] Window rect (screen coordinates): (" 
-               << windowRect.left << L", " << windowRect.top << L") - (" 
-               << windowRect.right << L", " << windowRect.bottom << L")\n";
+    // 获取根元素
+    IUIAutomationElement* rootElement = nullptr;
+    HRESULT hr = m_pAutomation->ElementFromHandle(hwnd, &rootElement);
     
-    // ✅ 检查点击位置是否在窗口内
-    bool isInsideWindow = (pt.x >= windowRect.left && pt.x <= windowRect.right &&
-                          pt.y >= windowRect.top && pt.y <= windowRect.bottom);
-    std::wcout << L"[DEBUG] Click is " << (isInsideWindow ? L"INSIDE" : L"OUTSIDE") 
-               << L" window rect (expected: INSIDE)\n";
-    
-    // ✅ 关键修复：多次刷新 UI Automation 缓存
-    // Chrome 的 UI Automation 更新是异步的，需要多次刷新
-    std::wcout << L"[DEBUG] Starting multi-stage cache refresh...\n";
-    
-    for (int i = 0; i < 3; i++) {
-        IUIAutomationElement* tempElement = nullptr;
-        HRESULT hr = m_pAutomation->ElementFromHandle(hwnd, &tempElement);
-        
-        if (SUCCEEDED(hr) && tempElement) {
-            // 强制获取边界矩形，触发缓存更新
-            RECT dummyRect;
-            tempElement->get_CurrentBoundingRectangle(&dummyRect);
-            
-            // 尝试从坐标获取元素，强制 UI Automation 查询最新状态
-            IUIAutomationElement* pointTest = nullptr;
-            m_pAutomation->ElementFromPoint(pt, &pointTest);
-            if (pointTest) {
-                // 获取 Name 也会触发更新
-                BSTR testName = nullptr;
-                pointTest->get_CurrentName(&testName);
-                if (testName) SysFreeString(testName);
-                pointTest->Release();
-            }
-            
-            tempElement->Release();
-        }
-        
-        // 渐进式延迟：第一次 50ms，第二次 30ms，第三次 20ms
-        Sleep(50 - i * 15);
+    if (FAILED(hr) || !rootElement) {
+        return result;
     }
     
-    std::wcout << L"[DEBUG] Cache refresh completed, fetching final element...\n";
+    // ✅ 优化：先找到内容区域，减少遍历范围
+    IUIAutomationElement* contentArea = FindContentArea(rootElement);
+    IUIAutomationElement* searchRoot = contentArea ? contentArea : rootElement;
     
-    // 现在获取最终的元素
-    IUIAutomationElement* pointElement = nullptr;
-    HRESULT hr = m_pAutomation->ElementFromPoint(pt, &pointElement);
+    // 获取 TreeWalker
+    IUIAutomationTreeWalker* walker = nullptr;
+    hr = m_pAutomation->get_RawViewWalker(&walker);
     
-    if (SUCCEEDED(hr) && pointElement) {
-        std::wcout << L"[DEBUG] ElementFromPoint succeeded!\n";
-        
+    if (FAILED(hr) || !walker) {
+        if (contentArea) contentArea->Release();
+        rootElement->Release();
+        return result;
+    }
+    
+    // ✅ 在元素树中查找目标元素
+    IUIAutomationElement* targetElement = FindElementAtPointInTree(searchRoot, pt, walker, 0);
+    
+    // 如果在内容区域中找不到，尝试在整个窗口中查找
+    if (!targetElement && contentArea) {
+        targetElement = FindElementAtPointInTree(rootElement, pt, walker, 0);
+    }
+    
+    walker->Release();
+    
+    if (targetElement) {
+        // 获取元素信息
         CONTROLTYPEID controlType;
-        pointElement->get_CurrentControlType(&controlType);
+        targetElement->get_CurrentControlType(&controlType);
         result.elementType = GetElementTypeString(controlType);
         
-        // 调试信息
-        BSTR debugName = nullptr;
-        pointElement->get_CurrentName(&debugName);
-        std::wcout << L"[DEBUG] ElementFromPoint - Type: " << result.elementType 
-                   << L", Name: " << (debugName ? debugName : L"(empty)") << L"\n";
-        if (debugName) SysFreeString(debugName);
-        
         // 获取内容
-        result.content = TryGetElementContent(pointElement, controlType);
+        result.content = TryGetElementContent(targetElement, controlType);
         
         if (result.content.empty()) {
+            // 如果当前元素没内容，递归查找子元素
             IUIAutomationTreeWalker* contentWalker = nullptr;
             m_pAutomation->get_RawViewWalker(&contentWalker);
             if (contentWalker) {
-                result.content = TraverseForContent(pointElement, contentWalker, 0, 3);
+                result.content = TraverseForContent(targetElement, contentWalker, 0, 3);
                 contentWalker->Release();
             }
         }
         
-        pointElement->Release();
+        targetElement->Release();
     } else {
-        std::wcout << L"[DEBUG] ElementFromPoint failed after refresh\n";
+        // ✅ 后备方案：如果树遍历失败，使用 ElementFromPoint
+        IUIAutomationElement* pointElement = nullptr;
+        hr = m_pAutomation->ElementFromPoint(pt, &pointElement);
+        
+        if (SUCCEEDED(hr) && pointElement) {
+            CONTROLTYPEID controlType;
+            pointElement->get_CurrentControlType(&controlType);
+            result.elementType = GetElementTypeString(controlType);
+            result.content = TryGetElementContent(pointElement, controlType);
+            
+            if (result.content.empty()) {
+                IUIAutomationTreeWalker* contentWalker = nullptr;
+                m_pAutomation->get_RawViewWalker(&contentWalker);
+                if (contentWalker) {
+                    result.content = TraverseForContent(pointElement, contentWalker, 0, 3);
+                    contentWalker->Release();
+                }
+            }
+            
+            pointElement->Release();
+        }
     }
+    
+    if (contentArea) contentArea->Release();
+    rootElement->Release();
     
     if (result.content.empty()) {
         result.content = L"[No Content Found]";
@@ -494,7 +473,6 @@ IUIAutomationElement* MouseTracker::FindContentArea(IUIAutomationElement* rootEl
         condition->Release();
         
         if (SUCCEEDED(hr) && docElement) {
-            std::wcout << L"[DEBUG] Found Document element (content area)\n";
             return docElement;
         }
     }
@@ -511,8 +489,6 @@ IUIAutomationElement* MouseTracker::FindContentArea(IUIAutomationElement* rootEl
         if (SUCCEEDED(hr) && paneArray) {
             int length = 0;
             paneArray->get_Length(&length);
-            
-            std::wcout << L"[DEBUG] Found " << length << L" Pane elements, checking for content area...\n";
             
             // 遍历所有 Pane，找到最有可能是内容区的那个
             for (int i = 0; i < length && i < 20; i++) {
@@ -540,7 +516,6 @@ IUIAutomationElement* MouseTracker::FindContentArea(IUIAutomationElement* rootEl
                         idStr.find(L"TabBar") != std::wstring::npos;
                     
                     if (!isExcluded) {
-                        std::wcout << L"[DEBUG] Found potential content Pane: " << nameStr << L"\n";
                         paneArray->Release();
                         return pane;
                     }
@@ -554,7 +529,6 @@ IUIAutomationElement* MouseTracker::FindContentArea(IUIAutomationElement* rootEl
     }
     
     // 3. 如果都没找到，返回 nullptr（使用根元素）
-    std::wcout << L"[DEBUG] No specific content area found\n";
     return nullptr;
 }
 
@@ -569,38 +543,55 @@ IUIAutomationElement* MouseTracker::FindElementAtPointInTree(IUIAutomationElemen
     HRESULT hr = element->get_CurrentBoundingRectangle(&rect);
     
     if (FAILED(hr)) {
-        std::wcout << L"[DEBUG] Depth " << depth << L": Failed to get bounding rectangle\n";
         return nullptr;
     }
     
-    // 调试：输出元素边界和点击位置
-    if (depth == 0) {
-        std::wcout << L"[DEBUG] Root element rect: (" << rect.left << L", " << rect.top 
-                   << L") - (" << rect.right << L", " << rect.bottom << L")\n";
-        std::wcout << L"[DEBUG] Click point: (" << pt.x << L", " << pt.y << L")\n";
+    // 关键修复：对于 Document 元素，如果边界矩形为 (0,0)-(0,0)，使用父窗口的边界
+    if (rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0) {
+        // 尝试从元素获取窗口句柄
+        IUIAutomationElement* rootElement = element;
+        HWND hwnd = nullptr;
+        
+        // 向上查找直到找到有效的窗口句柄
+        while (rootElement) {
+            UIA_HWND uiaHwnd = 0;
+            if (SUCCEEDED(rootElement->get_CurrentNativeWindowHandle(&uiaHwnd)) && uiaHwnd) {
+                hwnd = (HWND)(LONG_PTR)uiaHwnd;
+                break;
+            }
+            
+            IUIAutomationTreeWalker* tempWalker = nullptr;
+            if (SUCCEEDED(m_pAutomation->get_RawViewWalker(&tempWalker)) && tempWalker) {
+                IUIAutomationElement* parent = nullptr;
+                if (SUCCEEDED(tempWalker->GetParentElement(rootElement, &parent)) && parent) {
+                    if (rootElement != element) rootElement->Release();
+                    rootElement = parent;
+                } else {
+                    tempWalker->Release();
+                    break;
+                }
+                tempWalker->Release();
+            } else {
+                break;
+            }
+        }
+        
+        if (hwnd && IsWindow(hwnd)) {
+            GetWindowRect(hwnd, &rect);
+        }
+        
+        if (rootElement != element) rootElement->Release();
     }
     
     // 如果点不在当前元素内，返回 null
     if (pt.x < rect.left || pt.x > rect.right || pt.y < rect.top || pt.y > rect.bottom) {
-        if (depth == 0) {
-            std::wcout << L"[DEBUG] Click point is OUTSIDE root element bounds!\n";
-        }
         return nullptr;
     }
     
-    if (depth == 0) {
-        std::wcout << L"[DEBUG] Click point is inside root element, starting traversal...\n";
-    }
-    
-    // ✅ 关键改进：点在当前元素内，先检查当前元素是否有文本内容
+    // 关键改进：点在当前元素内，先检查当前元素是否有文本内容
     CONTROLTYPEID controlType;
     element->get_CurrentControlType(&controlType);
     std::wstring currentContent = TryGetElementContent(element, controlType);
-    
-    if (!currentContent.empty()) {
-        // 当前元素有内容，但还要检查是否有更精确的子元素也有内容
-        std::wcout << L"[DEBUG] Element at depth " << depth << " has content: " << currentContent.substr(0, 30) << L"...\n";
-    }
     
     // 继续查找子元素，看是否有更精确（面积更小）且有内容的子元素
     IUIAutomationElement* child = nullptr;
@@ -654,27 +645,23 @@ IUIAutomationElement* MouseTracker::FindElementAtPointInTree(IUIAutomationElemen
         child = next;
     }
     
-    // ✅ 决策逻辑：
+    // 决策逻辑：
     // 1. 如果找到有内容的子元素，返回它
     // 2. 如果当前元素有内容但没找到有内容的子元素，返回当前元素
     // 3. 如果都没内容，返回面积最小的子元素或当前元素
     if (bestMatch && bestHasContent) {
         // 找到了有内容的子元素
-        std::wcout << L"[DEBUG] Returning child element with content\n";
         return bestMatch;
     } else if (!currentContent.empty()) {
         // 当前元素有内容，没找到更好的子元素
-        std::wcout << L"[DEBUG] Returning current element with content\n";
         if (bestMatch) bestMatch->Release();
         element->AddRef();
         return element;
     } else if (bestMatch) {
         // 都没内容，返回最小的子元素
-        std::wcout << L"[DEBUG] Returning smallest child element (no content found)\n";
         return bestMatch;
     } else {
         // 没有子元素，返回当前元素
-        std::wcout << L"[DEBUG] Returning current element (no children)\n";
         element->AddRef();
         return element;
     }
@@ -692,7 +679,6 @@ std::wstring MouseTracker::TraverseForContent(IUIAutomationElement* element, IUI
     std::wstring content = TryGetElementContent(element, controlType);
     
     if (!content.empty()) {
-        std::wcout << L"[DEBUG] Found content at depth " << depth << L": " << content.substr(0, 50) << L"...\n";
         return content;
     }
     
@@ -721,15 +707,19 @@ std::wstring MouseTracker::TraverseForContent(IUIAutomationElement* element, IUI
 // 新增辅助函数：尝试从元素获取内容（封装所有获取方法）
 std::wstring MouseTracker::TryGetElementContent(IUIAutomationElement* element, CONTROLTYPEID controlType) {
     if (!element) return L"";
-    
+
     std::wstring result;
     HRESULT hr;
-    
+
     // 1. 首先尝试获取 Name 属性
     BSTR name = nullptr;
     if (SUCCEEDED(element->get_CurrentName(&name)) && name) {
         std::wstring nameStr = name;
         SysFreeString(name);
+        
+        // ✅ 修 trimmed首尾空白字符
+        nameStr = TrimWhitespace(nameStr);
+        
         if (!nameStr.empty()) {
             result = nameStr;
             
@@ -742,6 +732,7 @@ std::wstring MouseTracker::TryGetElementContent(IUIAutomationElement* element, C
                     if (SUCCEEDED(valuePattern->get_CurrentValue(&url)) && url) {
                         std::wstring urlStr = url;
                         SysFreeString(url);
+                        urlStr = TrimWhitespace(urlStr);
                         if (!urlStr.empty()) {
                             result += L" → " + urlStr;
                         }
@@ -762,6 +753,7 @@ std::wstring MouseTracker::TryGetElementContent(IUIAutomationElement* element, C
         if (SUCCEEDED(valuePattern->get_CurrentValue(&value)) && value) {
             std::wstring valueStr = value;
             SysFreeString(value);
+            valueStr = TrimWhitespace(valueStr);
             if (!valueStr.empty()) {
                 result = valueStr;
                 valuePattern->Release();
@@ -781,6 +773,7 @@ std::wstring MouseTracker::TryGetElementContent(IUIAutomationElement* element, C
             if (SUCCEEDED(textRange->GetText(-1, &text)) && text) {
                 std::wstring textStr = text;
                 SysFreeString(text);
+                textStr = TrimWhitespace(textStr);
                 if (!textStr.empty()) {
                     result = textStr;
                     textRange->Release();
@@ -798,22 +791,12 @@ std::wstring MouseTracker::TryGetElementContent(IUIAutomationElement* element, C
     if (SUCCEEDED(element->get_CurrentHelpText(&helpText)) && helpText) {
         std::wstring helpStr = helpText;
         SysFreeString(helpText);
+        helpStr = TrimWhitespace(helpStr);
         if (!helpStr.empty()) {
             result = helpStr;
             return result;
         }
     }
-    
-    // 5. 最后尝试 AutomationId
-    //BSTR autoId = nullptr;
-    //if (SUCCEEDED(element->get_CurrentAutomationId(&autoId)) && autoId) {
-    //    std::wstring idStr = autoId;
-    //    SysFreeString(autoId);
-    //    if (!idStr.empty()) {
-    //        result = L"[ID: " + idStr + L"]";
-    //        return result;
-    //    }
-    //}
     
     return result;  // 返回空字符串表示未找到内容
 }
@@ -1011,4 +994,29 @@ std::wstring GetCurrentTimeString() {
     wchar_t buffer[100];
     wcsftime(buffer, 100, L"%Y-%m-%d %H:%M:%S", &tm_val);
     return std::wstring(buffer);
+}
+
+// 修剪首尾空白字符（空格、制表符、换行符等）
+std::wstring TrimWhitespace(const std::wstring& str) {
+    if (str.empty()) return str;
+    
+    // 查找第一个非空白字符
+    size_t start = 0;
+    while (start < str.length() && ::iswspace(str[start])) {
+        start++;
+    }
+    
+    // 如果全是空白字符
+    if (start == str.length()) {
+        return L"";
+    }
+    
+    // 查找最后一个非空白字符
+    size_t end = str.length() - 1;
+    while (end > start && ::iswspace(str[end])) {
+        end--;
+    }
+    
+    // 返回修剪后的字符串
+    return str.substr(start, end - start + 1);
 }

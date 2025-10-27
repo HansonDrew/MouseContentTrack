@@ -113,3 +113,4 @@ private:
 // 辅助函数
 std::wstring MouseEventTypeToString(MouseEventType type);
 std::wstring GetCurrentTimeString();
+std::wstring TrimWhitespace(const std::wstring& str);  // 修剪首尾空白字符
