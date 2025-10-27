@@ -220,7 +220,7 @@ void MouseTracker::ProcessMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT* mouseI
                        << L") - (" << topRect.right << L", " << topRect.bottom << L")\n";
             
             bool isInside = (mouseInfo->pt.x >= topRect.left && mouseInfo->pt.x < topRect.right &&
-                           mouseInfo->pt.y >= topRect.top && mouseInfo->pt.y < topRect.bottom);
+                           mouseInfo->pt.y >= topRect.top && pt.y < topRect.bottom);
             std::wcout << L"  Click is " << (isInside ? L"INSIDE" : L"OUTSIDE") 
                        << L" target window bounds\n";
         }
@@ -373,7 +373,6 @@ MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND 
     }
 
     // ✅ 关键修复：使用传入的 targetWindow（点击时的窗口），而不是 GetForegroundWindow
-    // 因为这个函数在延迟之前调用，此时前台窗口可能还没有切换
     HWND hwnd = targetWindow;
     if (!hwnd || !IsWindow(hwnd)) {
         std::wcout << L"[DEBUG] Target window invalid, using foreground window as fallback\n";
@@ -400,128 +399,73 @@ MouseTracker::ElementInfo MouseTracker::GetElementContentAtPoint(POINT pt, HWND 
     std::wcout << L"[DEBUG] Click is " << (isInsideWindow ? L"INSIDE" : L"OUTSIDE") 
                << L" window rect (expected: INSIDE)\n";
     
-    IUIAutomationElement* rootElement = nullptr;
-    HRESULT hr = m_pAutomation->ElementFromHandle(hwnd, &rootElement);
+    // ✅ 关键修复：多次刷新 UI Automation 缓存
+    // Chrome 的 UI Automation 更新是异步的，需要多次刷新
+    std::wcout << L"[DEBUG] Starting multi-stage cache refresh...\n";
     
-    if (FAILED(hr) || !rootElement) {
-        std::wcout << L"[DEBUG] Failed to get root element from window handle\n";
-        return result;
-    }
-    
-    std::wcout << L"[DEBUG] Got root element, searching for content area...\n";
-    
-    // ✅ 关键：先找到内容区域（Document 或合适的 Pane），像 BrowserContentExtractor 那样
-    IUIAutomationElement* contentArea = FindContentArea(rootElement);
-    
-    IUIAutomationElement* searchRoot = contentArea ? contentArea : rootElement;
-    
-    if (contentArea) {
-        std::wcout << L"[DEBUG] Found content area, searching within it\n";
-    } else {
-        std::wcout << L"[DEBUG] No content area found, searching entire window\n";
-    }
-    
-    // 获取 TreeWalker
-    IUIAutomationTreeWalker* walker = nullptr;
-    hr = m_pAutomation->get_RawViewWalker(&walker);
-    
-    if (FAILED(hr) || !walker) {
-        if (contentArea) contentArea->Release();
-        rootElement->Release();
-        return result;
-    }
-    
-    // 在内容区域中查找包含点击坐标的元素
-    std::wcout << L"[DEBUG] Searching for element at point (" << pt.x << L", " << pt.y << L")\n";
-    
-    IUIAutomationElement* targetElement = FindElementAtPointInTree(searchRoot, pt, walker, 0);
-    
-    // ✅ 如果在内容区域中找不到，尝试在整个窗口中查找
-    if (!targetElement && contentArea) {
-        std::wcout << L"[DEBUG] Not found in content area, searching entire window...\n";
-        targetElement = FindElementAtPointInTree(rootElement, pt, walker, 0);
-    }
-    
-    walker->Release();
-    
-    if (targetElement) {
-        std::wcout << L"[DEBUG] Found target element in tree!\n";
+    for (int i = 0; i < 3; i++) {
+        IUIAutomationElement* tempElement = nullptr;
+        HRESULT hr = m_pAutomation->ElementFromHandle(hwnd, &tempElement);
         
-        // 获取元素信息
+        if (SUCCEEDED(hr) && tempElement) {
+            // 强制获取边界矩形，触发缓存更新
+            RECT dummyRect;
+            tempElement->get_CurrentBoundingRectangle(&dummyRect);
+            
+            // 尝试从坐标获取元素，强制 UI Automation 查询最新状态
+            IUIAutomationElement* pointTest = nullptr;
+            m_pAutomation->ElementFromPoint(pt, &pointTest);
+            if (pointTest) {
+                // 获取 Name 也会触发更新
+                BSTR testName = nullptr;
+                pointTest->get_CurrentName(&testName);
+                if (testName) SysFreeString(testName);
+                pointTest->Release();
+            }
+            
+            tempElement->Release();
+        }
+        
+        // 渐进式延迟：第一次 50ms，第二次 30ms，第三次 20ms
+        Sleep(50 - i * 15);
+    }
+    
+    std::wcout << L"[DEBUG] Cache refresh completed, fetching final element...\n";
+    
+    // 现在获取最终的元素
+    IUIAutomationElement* pointElement = nullptr;
+    HRESULT hr = m_pAutomation->ElementFromPoint(pt, &pointElement);
+    
+    if (SUCCEEDED(hr) && pointElement) {
+        std::wcout << L"[DEBUG] ElementFromPoint succeeded!\n";
+        
         CONTROLTYPEID controlType;
-        targetElement->get_CurrentControlType(&controlType);
+        pointElement->get_CurrentControlType(&controlType);
         result.elementType = GetElementTypeString(controlType);
         
-        // 调试：输出元素信息
+        // 调试信息
         BSTR debugName = nullptr;
-        BSTR debugClassName = nullptr;
-        targetElement->get_CurrentName(&debugName);
-        targetElement->get_CurrentClassName(&debugClassName);
-        
-        std::wcout << L"[DEBUG] Target element info:\n"
-                   << L"  Type: " << result.elementType << L"\n"
-                   << L"  Name: " << (debugName ? debugName : L"(empty)") << L"\n"
-                   << L"  ClassName: " << (debugClassName ? debugClassName : L"(empty)") << L"\n";
-        
+        pointElement->get_CurrentName(&debugName);
+        std::wcout << L"[DEBUG] ElementFromPoint - Type: " << result.elementType 
+                   << L", Name: " << (debugName ? debugName : L"(empty)") << L"\n";
         if (debugName) SysFreeString(debugName);
-        if (debugClassName) SysFreeString(debugClassName);
         
         // 获取内容
-        result.content = TryGetElementContent(targetElement, controlType);
+        result.content = TryGetElementContent(pointElement, controlType);
         
         if (result.content.empty()) {
-            // 如果当前元素没内容，递归查找子元素
-            std::wcout << L"[DEBUG] Target element has no content, searching children...\n";
             IUIAutomationTreeWalker* contentWalker = nullptr;
             m_pAutomation->get_RawViewWalker(&contentWalker);
             if (contentWalker) {
-                result.content = TraverseForContent(targetElement, contentWalker, 0, 3);
+                result.content = TraverseForContent(pointElement, contentWalker, 0, 3);
                 contentWalker->Release();
             }
         }
         
-        targetElement->Release();
+        pointElement->Release();
     } else {
-        std::wcout << L"[DEBUG] Could not find target element in tree, trying ElementFromPoint as fallback...\n";
-        
-        // ✅ 后备方案：使用 ElementFromPoint 直接获取
-        IUIAutomationElement* pointElement = nullptr;
-        hr = m_pAutomation->ElementFromPoint(pt, &pointElement);
-        
-        if (SUCCEEDED(hr) && pointElement) {
-            std::wcout << L"[DEBUG] ElementFromPoint succeeded!\n";
-            
-            CONTROLTYPEID controlType;
-            pointElement->get_CurrentControlType(&controlType);
-            result.elementType = GetElementTypeString(controlType);
-            
-            // 调试信息
-            BSTR debugName = nullptr;
-            pointElement->get_CurrentName(&debugName);
-            std::wcout << L"[DEBUG] ElementFromPoint - Type: " << result.elementType 
-                       << L", Name: " << (debugName ? debugName : L"(empty)") << L"\n";
-            if (debugName) SysFreeString(debugName);
-            
-            // 获取内容
-            result.content = TryGetElementContent(pointElement, controlType);
-            
-            if (result.content.empty()) {
-                IUIAutomationTreeWalker* contentWalker = nullptr;
-                m_pAutomation->get_RawViewWalker(&contentWalker);
-                if (contentWalker) {
-                    result.content = TraverseForContent(pointElement, contentWalker, 0, 3);
-                    contentWalker->Release();
-                }
-            }
-            
-            pointElement->Release();
-        } else {
-            std::wcout << L"[DEBUG] ElementFromPoint also failed\n";
-        }
+        std::wcout << L"[DEBUG] ElementFromPoint failed after refresh\n";
     }
-    
-    if (contentArea) contentArea->Release();
-    rootElement->Release();
     
     if (result.content.empty()) {
         result.content = L"[No Content Found]";
